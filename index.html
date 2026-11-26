@@ -755,7 +755,7 @@ body.con-intro #scroll{overflow:hidden}
 .login input.codigo{font-size:27px;font-weight:800;letter-spacing:.2em;padding:16px 8px 16px 16px;
   font-variant-numeric:tabular-nums}
 .login input::placeholder{color:var(--label3);letter-spacing:normal;font-weight:500}
-.login input.codigo::placeholder{letter-spacing:.2em;font-weight:800}
+.login input.codigo::placeholder{letter-spacing:.2em;font-weight:800;color:var(--label3)}
 .login-pie{display:flex;align-items:center;justify-content:center;gap:9px;margin-top:17px}
 .login-pie button{color:var(--brand);font-size:13.5px;font-weight:700}
 .login-pie span{color:var(--label3);font-size:13px}
@@ -766,6 +766,15 @@ body.con-intro #scroll{overflow:hidden}
 .splash .logo-marca{width:58px;height:51px;animation:latido 1.6s ease-in-out infinite}
 @keyframes latido{0%,100%{opacity:.4;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
 @media (prefers-reduced-motion:reduce){.splash .logo-marca{animation:none;opacity:1}}
+
+.btn-google{width:100%;display:flex;align-items:center;justify-content:center;gap:11px;
+  background:var(--card);border:1.5px solid var(--line);border-radius:17px;padding:15px 18px;
+  font-size:15.5px;font-weight:700;letter-spacing:-.02em;color:var(--ink);box-shadow:var(--shadow);
+  transition:transform .16s}
+.btn-google:active{transform:scale(.985)}
+.btn-google:disabled{opacity:.6}
+.login .privacidad p.t{font-size:13.5px}
+.login .privacidad p{font-size:12.5px}
 </style>
 <link rel="manifest" href="manifest.json">
 </head>
@@ -832,7 +841,7 @@ const PROJ={saldo:0,aporte:null,rate:5,plazo:12,meta:0,usaAguinaldo:true};
 const DEF={name:"",onboarded:false,tourDone:false,vioIntro:false,monedas:null,hormigaMax:5000,people:[],extraIncomes:[],hasSav:null,hasDebt:null,goals:[],fxDate:"2026-10-02",fx:460,monthsBack:5,includeOwn:false,rules:{},excludeKeys:{},debts:[],holder:"",skipped:[],lastSync:null,salary:structuredClone(SALARY),proj:structuredClone(PROJ)};
 let settings=structuredClone(DEF);
 let months={}, current=ymKey(new Date()), tab="inicio", filterCat=null, filterMet=null, filterSmall=false, query="", syncing=false, store=null, wiz=0, intro=null, tour=null, probe=null,
-    sb=null, sesion=null, alias=null, arrancando=true, authPaso="correo", authCorreo="", authMsg="", authCargando=false;
+    sb=null, sesion=null, alias=null, arrancando=true, tCodigo=null, pendiente=false, gToken=null, authPaso="correo", authModo="google", authCorreo="", authMsg="", authCargando=false;
 
 /* ===== Cuenta ===== */
 // La llave publishable es pública a propósito: por sí sola no puede leer nada,
@@ -847,15 +856,231 @@ async function initAuth(){
     const{data,error}=await sb.auth.getSession();
     if(error)throw error;
     sesion=data?.session||false;
-    sb.auth.onAuthStateChange((_e,s)=>{
+    if(sesion?.provider_token)guardarGToken(sesion.provider_token);else recuperarGToken();
+    sb.auth.onAuthStateChange(async(_e,s)=>{
       const antes=!!sesion; sesion=s||false;
-      if(s&&!antes){traerAlias().then(render)}
+      if(s?.provider_token)guardarGToken(s.provider_token);
+      if(s&&!antes){
+        // Recién entró: traemos lo suyo de la nube
+        arrancando=true;render();
+        await traerAlias();
+        await initStore();
+        arrancando=false;render();
+        if(gToken)syncGoogle();
+        return;
+      }
+      if(!s&&antes){
+        // Se salió: que no quede nada suyo en este teléfono
+        alias=null;marcarPendiente(false);guardarGToken(null);
+        try{localStorage.removeItem("pacci-v1")}catch(e){}
+        aplicar(null,{});
+        wiz=0;intro=null;tour=null;tab="inicio";chat=[];
+      }
       render();
     });
     if(sesion)traerAlias();
     return true;
   }catch(e){console.warn("auth",e);sb=null;sesion=null;return false}
 }
+// La app guarda la hora de pared de Costa Rica sin zona ("2026-11-24T13:34").
+// Postgres la leería como UTC y correría 6 horas, moviendo compras de fin de mes
+// al mes siguiente. Por eso la etiquetamos al salir y la devolvemos al entrar.
+const CR_OFF="-06:00";
+function tsASupabase(s){
+  s=String(s||"");
+  if(/[zZ]|[+-]\d\d:?\d\d$/.test(s))return s;
+  if(s.length===16)s+=":00";
+  return s+CR_OFF;
+}
+function tsDesdeSupabase(iso){
+  const d=new Date(iso);
+  if(isNaN(d))return String(iso||"").slice(0,16);
+  return new Date(d.getTime()-6*3600*1000).toISOString().slice(0,16);
+}
+function aFila(t,uid){
+  return {user_id:uid,ts:tsASupabase(t.ts),merchant:t.merchant||"",
+    amount:Math.abs(Number(t.amount)||0),currency:t.currency||"CRC",kind:t.kind||"card",
+    income:!!t.income,own:!!t.own,refund:!!t.refund,
+    beneficiary:t.beneficiary||null,concept:t.concept||null,cat_manual:t.catManual||null,
+    dedupe_key:String(t.id)};
+}
+function deFila(f){
+  const t={id:f.dedupe_key,ts:tsDesdeSupabase(f.ts),merchant:f.merchant||"",
+    amount:Number(f.amount)||0,currency:f.currency||"CRC",kind:f.kind||"card",
+    income:!!f.income,own:!!f.own,refund:!!f.refund};
+  if(f.beneficiary)t.beneficiary=f.beneficiary;
+  if(f.concept)t.concept=f.concept;
+  if(f.cat_manual)t.catManual=f.cat_manual;
+  return t;
+}
+function leerLocal(){
+  try{
+    const raw=localStorage.getItem("pacci-v1")||localStorage.getItem("plata-v1");
+    return raw?JSON.parse(raw):null;
+  }catch(e){return null}
+}
+function aplicar(s,ms){
+  settings={...structuredClone(DEF),...(s||{})};
+  settings.salary={...structuredClone(SALARY),...(s?.salary||{})};
+  settings.salary.rates={...SALARY.rates,...(s?.salary?.rates||{})};
+  settings.proj={...structuredClone(PROJ),...(s?.proj||{})};
+  months=ms||{};
+  migrate();
+}
+
+/* ===== Gmail directo, con la cuenta de cada quien =====
+   El permiso lo da Google al entrar. El token de acceso dura cerca de una hora;
+   cuando vence, se pide reconectar. El de refresco no se guarda en el teléfono. */
+const GSCOPE="https://www.googleapis.com/auth/gmail.readonly";
+function guardarGToken(t){
+  gToken=t||null;
+  try{t?localStorage.setItem("pacci-gt",t):localStorage.removeItem("pacci-gt")}catch(e){}
+}
+function recuperarGToken(){
+  try{gToken=localStorage.getItem("pacci-gt")||null}catch(e){gToken=null}
+  return gToken;
+}
+async function entrarConGoogle(){
+  // Este botón vive en dos pantallas y solo una dibuja authMsg, así que el
+  // error va también por toast: un botón que no hace nada no dice nada.
+  if(!sb){toast("La cuenta en la nube no cargó. Revisá tu conexión y recargá.",true);return}
+  authCargando=true;authMsg="";render();
+  let error=null;
+  try{
+    const r=await sb.auth.signInWithOAuth({
+      provider:"google",
+      options:{
+        scopes:GSCOPE,
+        redirectTo:location.origin+location.pathname,
+        queryParams:{access_type:"offline",prompt:"consent"}
+      }
+    });
+    error=r&&r.error;
+  }catch(e){error=e}
+  if(error){
+    authCargando=false;
+    const razon=String(error.message||error.error_description||error.code||error).slice(0,160);
+    authMsg="Google no abrió: "+razon;
+    toast("Google no abrió: "+razon,true);
+    render();
+  }
+}
+// Llamadas a Gmail desde el navegador. Google permite CORS con el token al frente.
+async function gApi(ruta,params){
+  if(!gToken)throw{code:"needs_reauth"};
+  const u=new URL("https://gmail.googleapis.com/gmail/v1/users/me/"+ruta);
+  for(const[k,v]of Object.entries(params||{}))if(v!=null&&v!=="")u.searchParams.set(k,v);
+  const r=await fetch(u,{headers:{Authorization:"Bearer "+gToken}});
+  if(r.status===401||r.status===403){guardarGToken(null);throw{code:"needs_reauth"}}
+  if(!r.ok)throw{code:"http_"+r.status,message:(await r.text()).slice(0,200)};
+  return r.json();
+}
+function b64url(s){
+  s=String(s||"").replace(/-/g,"+").replace(/_/g,"/");
+  try{
+    const bin=atob(s+"=".repeat((4-s.length%4)%4));
+    return new TextDecoder("utf-8").decode(Uint8Array.from(bin,c=>c.charCodeAt(0)));
+  }catch(e){return ""}
+}
+// BAC manda los datos en una tabla. Una fila de dos celdas se vuelve "Campo: valor",
+// que es exactamente la forma que el parser ya sabe leer.
+function htmlATexto(html){
+  let s=String(html||"")
+    .replace(/<style[\s\S]*?<\/style>/gi," ")
+    .replace(/<script[\s\S]*?<\/script>/gi," ")
+    .replace(/<!--[\s\S]*?-->/g," ");
+  // Las tablas de BAC vienen anidadas. Resolvemos de adentro hacia afuera:
+  // cada pasada solo toma las filas que ya no contienen otra fila dentro.
+  const FILA=/<tr[^>]*>((?:(?!<tr[\s>])[\s\S])*?)<\/tr>/gi;
+  const CELDA=/<t[dh][^>]*>((?:(?!<t[dh][\s>])[\s\S])*?)<\/t[dh]>/gi;
+  for(let i=0;i<6;i++){
+    const antes=s;
+    s=s.replace(FILA,(_,fila)=>{
+      // Ojo: una celda puede traer texto que ya convertimos en una pasada anterior,
+      // así que al aplanar respetamos los saltos de línea que ya existen.
+      const plano=t=>t.replace(/<[^>]+>/g," ").replace(/&nbsp;/gi," ").replace(/[^\S\n]+/g," ")
+        .replace(/[ ]*\n[ ]*/g,"\n").trim();
+      const celdas=[...fila.matchAll(CELDA)].map(m=>plano(m[1])).filter(Boolean);
+      if(celdas.length===2&&!celdas.some(c=>c.includes("\n")))
+        return `\n${celdas[0].replace(/\s*:\s*$/,"")}: ${celdas[1]}\n`;
+      return "\n"+celdas.join("\n")+"\n";
+    });
+    if(s===antes)break;
+  }
+  s=s.replace(/<br\s*\/?>/gi,"\n")
+    .replace(/<\/(p|div|h\d|li|td|th|tr|table)>/gi,"\n")
+    .replace(/<[^>]+>/g," ")
+    .replace(/&nbsp;/gi," ").replace(/&amp;/gi,"&").replace(/&lt;/gi,"<").replace(/&gt;/gi,">")
+    .replace(/&quot;/gi,'"').replace(/&#39;/g,"'")
+    .replace(/&#(\d+);/g,(_,d)=>String.fromCharCode(+d))
+    .replace(/&#x([0-9a-f]+);/gi,(_,x)=>String.fromCharCode(parseInt(x,16)))
+    .replace(/[ \t]+/g," ").replace(/[ \t]*\n[ \t]*/g,"\n").replace(/\n{2,}/g,"\n").trim();
+  return emparejar(s);
+}
+// Algunos correos ponen la etiqueta en una celda y el dato en otra fila, así que
+// quedan en dos líneas sueltas. Si vemos una etiqueta conocida sola, la unimos
+// con la línea siguiente para dejarla como "Campo: valor".
+const ETIQUETAS=["comercio","ciudad y país","ciudad y pais","fecha","monto","tipo de transacción",
+  "tipo de transaccion","autorización","autorizacion","referencia","número de tarjeta","numero de tarjeta",
+  "tarjeta","visa","mastercard","master card","amex","american express"];
+function emparejar(txt){
+  const ls=txt.split("\n"),out=[];
+  for(let i=0;i<ls.length;i++){
+    const l=ls[i].trim();
+    const limpia=l.replace(/\s*:\s*$/,"").toLowerCase();
+    if(l&&!/:/.test(l.slice(0,-1))&&ETIQUETAS.includes(limpia)&&ls[i+1]&&!/:\s/.test(ls[i+1])){
+      out.push(`${l.replace(/\s*:\s*$/,"")}: ${ls[i+1].trim()}`);i++;
+    }else out.push(l);
+  }
+  return out.join("\n");
+}
+function cuerpoDe(payload){
+  const buscar=(p,tipo)=>{
+    if(!p)return null;
+    if(p.mimeType===tipo&&p.body&&p.body.data)return b64url(p.body.data);
+    for(const hijo of p.parts||[]){const r=buscar(hijo,tipo);if(r)return r}
+    return null;
+  };
+  const plano=buscar(payload,"text/plain");
+  if(plano&&plano.trim().length>40)return plano;
+  const html=buscar(payload,"text/html");
+  return html?htmlATexto(html):(plano||"");
+}
+// Lo acomodamos con los mismos nombres que ya usaba el parser, para no tocarlo.
+function aMensaje(m){
+  const hs={};
+  for(const x of m.payload?.headers||[])hs[x.name.toLowerCase()]=x.value;
+  return {id:m.id,subject:hs.subject||"",date:hs.date||"",
+          snippet:m.snippet||"",plaintextBody:cuerpoDe(m.payload)};
+}
+
+/* ===== Lo que quedó sin subir =====
+   Si una escritura a la nube falla, lo marcamos. Nada se borra de este teléfono
+   mientras haya algo pendiente, y se reintenta cuando vuelve la señal. */
+function marcarPendiente(v){
+  pendiente=!!v;
+  try{localStorage.setItem("pacci-pend",v?"1":"")}catch(e){}
+  const b=document.querySelector(".pend");if(b)b.hidden=!v;
+}
+async function subirPendientes(silencioso){
+  if(store?.kind!=="sb"||!sb)return false;
+  try{
+    const{error}=await sb.from("profiles")
+      .upsert({user_id:store.uid,settings,updated_at:new Date().toISOString()},{onConflict:"user_id"});
+    if(error)throw error;
+    for(const k of Object.keys(months)){
+      const filas=Object.values(months[k]?.txns||{}).map(t=>aFila(t,store.uid));
+      if(!filas.length)continue;
+      const r=await sb.from("transactions").upsert(filas,{onConflict:"user_id,dedupe_key"});
+      if(r.error)throw r.error;
+    }
+    marcarPendiente(false);
+    if(!silencioso){toast("Listo, ya se subió lo que faltaba.");setTimeout(()=>{$("#toast").hidden=true},3000)}
+    return true;
+  }catch(e){marcarPendiente(true);return false}
+}
+window.addEventListener("online",()=>{if(pendiente)subirPendientes()});
+
 async function traerAlias(){
   try{
     const{data}=await sb.from("accounts").select("alias").maybeSingle();
@@ -888,8 +1113,14 @@ async function verificarCodigo(code){
   render();
 }
 async function salirCuenta(){
+  if(pendiente){
+    const ok=await subirPendientes(true);
+    if(!ok&&!confirm("Hay cambios que no se han podido subir a la nube. Si salís ahora se pierden.\n\n¿Salir de todos modos?"))return;
+  }
   try{await sb.auth.signOut()}catch(e){}
-  sesion=false;alias=null;authPaso="correo";authCorreo="";
+  sesion=false;alias=null;authPaso="correo";authCorreo="";guardarGToken(null);
+  try{localStorage.removeItem("pacci-v1")}catch(e){}
+  aplicar(null,{});
   closeSheet();render();
 }
 const caps={mcp:null,sample:null};
@@ -1429,6 +1660,43 @@ function isOwnName(name){
 
 /* ===== Guardado ===== */
 async function initStore(){
+  // 1) Si hay sesión, la nube manda.
+  if(sb&&sesion){
+    try{
+      const uid=sesion.user.id;
+      store={kind:"sb",uid};
+      const{data:perf,error:e1}=await sb.from("profiles").select("settings").maybeSingle();
+      if(e1)throw e1;
+      const nube=perf?.settings||null;
+      const vacioEnNube=!nube||!Object.keys(nube).length;
+      const local=leerLocal();
+      const hayLocal=!!(local?.settings&&(local.settings.onboarded||Object.keys(local.months||{}).length));
+
+      if(vacioEnNube&&hayLocal){
+        // Primera vez con cuenta: subimos lo que ya tenía en el teléfono.
+        aplicar(local.settings,local.months);
+        await saveSettings();
+        await saveMonths(Object.keys(months));
+        toast("Listo, tus datos ya están en la nube.");
+        setTimeout(()=>{$("#toast").hidden=true},4000);
+        return;
+      }
+      const{data:filas,error:e2}=await sb.from("transactions").select("*").order("ts",{ascending:false}).limit(5000);
+      if(e2)throw e2;
+      const ms={};
+      for(const f of filas||[]){
+        const t=deFila(f), k=t.ts.slice(0,7);
+        (ms[k]=ms[k]||{txns:{}}).txns[t.id]=t;
+      }
+      aplicar(nube,ms);
+      saveLocal();                       // copia local, por si después no hay señal
+      marcarPendiente(false);
+      return;
+    }catch(e){
+      console.warn("supabase",e);
+      toast("No pude leer tus datos de la nube. Estás viendo la copia de este teléfono.",true);
+    }
+  }
   try{
     const[db,user]=await Promise.all([window.claude?.use?.("db"),window.claude?.use?.("user")]);
     const uid=user?await user.id():null;
@@ -1462,17 +1730,39 @@ async function initStore(){
 function saveLocal(){try{localStorage.setItem("pacci-v1",JSON.stringify({settings,months}))}catch(e){}}
 async function saveSettings(){
   settings.skipped=(settings.skipped||[]).slice(-1500);
+  if(store?.kind==="sb"){
+    saveLocal();
+    try{
+      const{error}=await sb.from("profiles")
+        .upsert({user_id:store.uid,settings,updated_at:new Date().toISOString()},{onConflict:"user_id"});
+      if(error)throw error;
+      if(pendiente)subirPendientes(true);
+    }catch(e){marcarPendiente(true);toast("Guardado en este teléfono. Falta subirlo a la nube.",true)}
+    return;
+  }
   if(store?.kind==="db"){try{await store.root.set(settings)}catch(e){toast("No se pudieron guardar los ajustes.",true)}}
   else saveLocal();
 }
 async function saveMonths(keys){
+  if(store?.kind==="sb"){
+    saveLocal();
+    for(const k of keys){
+      const filas=Object.values(months[k]?.txns||{}).map(t=>aFila(t,store.uid));
+      if(!filas.length)continue;
+      try{
+        const{error}=await sb.from("transactions").upsert(filas,{onConflict:"user_id,dedupe_key"});
+        if(error)throw error;
+      }catch(e){marcarPendiente(true);toast("Guardado acá. Falta subir "+monthLabel(k),true)}
+    }
+    return;
+  }
   if(store?.kind==="db"){for(const k of keys){try{await store.root.collection("months").doc(k).set(months[k])}catch(e){toast("No se pudo guardar "+monthLabel(k),true)}}}
   else saveLocal();
 }
 
 /* ===== Gmail ===== */
 const ERR={
-  needs_reauth:"Tu conexión de Gmail expiró. Reconectala en claude.ai, en Ajustes, Conectores.",
+  needs_reauth:"Tu permiso de Gmail venció. Tocá Conectar Gmail para renovarlo.",
   server_not_connected:"Gmail no está conectado. Agregalo en claude.ai, en Ajustes, Conectores.",
   selection_required:"Tenés varias cuentas de Gmail conectadas. Elegí cuál usar en el aviso de Claude.",
   not_in_manifest:"No se dio permiso para leer Gmail. Recargá y aceptá el permiso.",
@@ -1491,9 +1781,79 @@ async function read(mcp,tool,input){
   }
 }
 function sinceDate(n){const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-(n-1));return `${d.getFullYear()}/${pad(d.getMonth()+1)}/01`}
-async function sync(){
+// Guarda un movimiento parseado donde corresponde. Lo comparten las dos vías.
+function guardarMov(t,id,dirty){
+  if(!t||!t.ts){settings.skipped.push(id);return 0}
+  if(t.kind==="card"&&t.holder&&!settings.holder)settings.holder=t.holder;
+  delete t.holder;
+  const k=t.ts.slice(0,7);
+  months[k]=months[k]||{txns:{}};
+  const dup=t.kind==="card"&&t.auth&&Object.values(months[k].txns).some(x=>x.auth===t.auth&&x.ref===t.ref&&x.amount===t.amount);
+  if(dup){settings.skipped.push(id);return 0}
+  months[k].txns[t.id]=t;dirty.add(k);return 1;
+}
+function consultaBAC(){
+  return `from:baccredomatic.cr (subject:transacción OR subject:transaccion OR subject:transferencia) after:${sinceDate(Number(settings.monthsBack)||5)}`;
+}
+
+/* ===== Sincronizar leyendo Gmail con el permiso del usuario ===== */
+async function syncGoogle(){
   if(syncing)return;
-  if(!caps.mcp){toast("Esta vista no puede leer Gmail. Abrila desde claude.ai o la app de Claude.",true);return}
+  if(!gToken){toast("Conectá tu Gmail para traer tus gastos.",true);return}
+  syncing=true;render();
+  toast("Buscando correos de tu banco…");
+  const known=knownIds(), todo=[];
+  try{
+    let token=null,pages=0;
+    do{
+      const p=await gApi("messages",{q:consultaBAC(),maxResults:100,pageToken:token});
+      for(const m of p.messages||[])if(!known.has(m.id))todo.push(m.id);
+      token=p.nextPageToken||null;pages++;
+    }while(token&&pages<10);
+  }catch(e){return failSync(e)}
+  if(!todo.length){
+    settings.lastSync=new Date().toISOString();await saveSettings();
+    syncing=false;toast("Todo al día.");render();return;
+  }
+  let done=0,added=0,failed=0,fatal=null;const dirty=new Set();
+  const tick=()=>toast(`Leyendo movimientos, ${done} de ${todo.length}`,false,done/todo.length);
+  tick();
+  const cola=todo.slice();
+  async function worker(){
+    while(cola.length&&!fatal){
+      const id=cola.shift();
+      try{
+        const cruda=await gApi("messages/"+id,{format:"full"});
+        const msg=aMensaje(cruda);
+        const s=msg.subject||"";
+        const t=/transferencia/i.test(s)?parseSinpe(msg):parseCard(msg);
+        added+=guardarMov(t,id,dirty);
+      }catch(e){
+        if(e&&e.code==="needs_reauth")fatal=e;else failed++;
+      }
+      done++;tick();
+      if(done%25===0&&dirty.size){const ks=[...dirty];dirty.clear();await saveMonths(ks)}
+    }
+  }
+  await Promise.all([worker(),worker(),worker()]);
+  for(const t of allTxns())if(t.kind==="sinpe"&&!t.income){const own=isOwnName(t.beneficiary);if(own!==!!t.own){t.own=own;dirty.add(t.ts.slice(0,7))}}
+  if(dirty.size)await saveMonths([...dirty]);
+  settings.lastSync=new Date().toISOString();await saveSettings();
+  syncing=false;
+  if(fatal)return failSync(fatal,added);
+  if(!months[current]){const ks=Object.keys(months).sort();if(ks.length)current=ks[ks.length-1]}
+  toast(`Listo, ${added} movimientos nuevos${failed?`, ${failed} correos no se pudieron leer`:""}.`);
+  render();
+}
+
+async function sync(){
+  if(gToken&&!caps.mcp)return syncGoogle();
+  if(syncing)return;
+  if(!caps.mcp){
+    toast(gToken?"Reintentando…":"Conectá tu Gmail desde Ajustes para traer tus gastos.",true);
+    if(gToken)return syncGoogle();
+    return;
+  }
   syncing=true;render();
   const mcp=caps.mcp;
   const q=`from:baccredomatic.cr {subject:transacción subject:transaccion subject:transferencia} after:${sinceDate(Number(settings.monthsBack)||5)}`;
@@ -2352,16 +2712,38 @@ const WIZ=[
    <div class="tip">${IC_META.reloj}<p>El tipo de cambio lo tomamos del <b>BCCR</b> automáticamente, hoy ${esc(fCRC.format(TC()))} por dólar. No tenés que escribirlo.</p></div>`}
 ];
 
+const IC_GOOGLE=`<svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
+  <path fill="#4285F4" d="M23.5 12.27c0-.79-.07-1.54-.2-2.27H12v4.3h6.45a5.5 5.5 0 0 1-2.39 3.62v3h3.86c2.26-2.08 3.58-5.15 3.58-8.65z"/>
+  <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96h-3.98v3.09A12 12 0 0 0 12 24z"/>
+  <path fill="#FBBC05" d="M5.27 14.29a7.2 7.2 0 0 1 0-4.58V6.62H1.29a12 12 0 0 0 0 10.76z"/>
+  <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0A12 12 0 0 0 1.29 6.62l3.98 3.09C6.22 6.86 8.87 4.75 12 4.75z"/></svg>`;
+
 function viewLogin(){
   hdrTitle="Pacci";
-  const correo=authPaso==="codigo";
+  if(authModo==="google")return `<div class="login">
+    <i class="logo-marca mark-logo"></i>
+    <h1>Entrá a Pacci</h1>
+    <p>Con tu cuenta de Google. De paso le das permiso de leer los avisos de tu banco, que es de donde salen tus gastos.</p>
+    <button class="btn-google" data-auth="google" ${authCargando?"disabled":""}>
+      ${IC_GOOGLE}<span>${authCargando?"Abriendo…":"Continuar con Google"}</span></button>
+    ${authMsg?`<p class="login-error">${esc(authMsg)}</p>`:""}
+    <div class="login-pie" style="margin-top:22px">
+      <button data-auth="modoCorreo">Prefiero entrar con un código por correo</button>
+    </div>
+    <div class="privacidad" style="margin-top:28px;text-align:left">
+      <p class="t">${IC_META.escudo} Solo leemos, y solo tu banco</p>
+      <p>Pacci busca únicamente los avisos de transacciones de tu banco. No lee el resto de tu correo, no manda nada y no puede mover plata. El permiso lo quitás cuando querás desde tu cuenta de Google.</p>
+    </div>
+  </div>`;
+
+  const esCodigo=authPaso==="codigo";
   return `<div class="login">
     <i class="logo-marca mark-logo"></i>
-    <h1>${correo?"Revisá tu correo":"Entrá a Pacci"}</h1>
-    <p>${correo
+    <h1>${esCodigo?"Revisá tu correo":"Entrá con tu correo"}</h1>
+    <p>${esCodigo
       ? `Te mandamos un código de 6 dígitos a <b>${esc(authCorreo)}</b>. Puede tardar un minuto.`
-      : "Con tu correo basta. No hay que inventarse una contraseña más."}</p>
-    ${correo?`
+      : "Te mandamos un código. Sin contraseñas."}</p>
+    ${esCodigo?`
       <input id="codigo" type="text" inputmode="numeric" autocomplete="one-time-code"
              maxlength="6" placeholder="000000" class="codigo" aria-label="Código de 6 dígitos">
       <button class="btn" data-auth="verificar" ${authCargando?"disabled":""} style="width:100%;margin-top:14px">
@@ -2375,9 +2757,12 @@ function viewLogin(){
       <input id="correo" type="email" inputmode="email" autocomplete="email" autocapitalize="off"
              spellcheck="false" placeholder="tucorreo@gmail.com" value="${esc(authCorreo)}" aria-label="Tu correo">
       <button class="btn" data-auth="pedir" ${authCargando?"disabled":""} style="width:100%;margin-top:14px">
-        ${authCargando?"Mandando…":"Mandame el código"}</button>`}
+        ${authCargando?"Mandando…":"Mandame el código"}</button>
+      <div class="login-pie" style="margin-top:20px">
+        <button data-auth="modoGoogle">Mejor entrar con Google</button>
+      </div>`}
     ${authMsg?`<p class="login-error">${esc(authMsg)}</p>`:""}
-    <p class="login-legal">Tus datos quedan ligados a este correo y solo vos los podés ver.</p>
+    ${!esCodigo?`<p class="login-legal">Entrando con correo no podemos leer tus gastos automáticamente. Eso solo funciona con Google.</p>`:""}
   </div>`;
 }
 
@@ -2414,7 +2799,11 @@ function viewAjustes(){
     <div class="cell"><label>Última sincronización</label><span class="val" style="font-size:15px;color:var(--label2)">${settings.lastSync?esc(new Date(settings.lastSync).toLocaleString("es-CR",{day:"numeric",month:"short",hour:"numeric",minute:"2-digit"})):"Nunca"}</span></div>
     <div class="cell"><label>Dónde se guardan<em>${store?.kind==="db"?"En tu cuenta de Claude, privados para vos":"Solo en este navegador"}</em></label></div>
     ${sesion?`<div class="cell"><label>Tu cuenta<em>${esc(sesion.user?.email||"")}</em></label><button class="btn quiet sm" data-auth="salir">Salir</button></div>
-    ${alias?`<div class="cell"><label>Tu correo de Pacci<em>Este es el que vas a meter en el banco</em></label><span class="val" style="font-size:12.5px">${esc(alias)}@in.pacci.app</span></div>`:""}`:""}
+    <div class="cell"><label>Gmail<em>${gToken?"Conectado. Tus gastos entran solos.":"Sin conectar. Los gastos no van a entrar."}</em></label>
+      ${gToken?`<span class="val in" style="font-size:13px">Activo</span>`:`<button class="btn quiet sm" data-auth="conectarGmail">Conectar</button>`}</div>
+    <div class="cell"><label>Sincronización<em>${pendiente?"Hay cambios guardados solo en este teléfono":"Todo subido a la nube"}</em></label>
+      ${pendiente?`<button class="btn quiet sm" data-act="subirYa">Subir ahora</button>`:`<span class="val in" style="font-size:13px">Al día</span>`}</div>
+`:""}
     <div class="cell"><label>Cómo funciona Pacci<em>Las cuatro pantallas de la bienvenida</em></label><button class="btn quiet sm" data-intro="abrir">Ver</button></div>
     <div class="cell"><label>Repetir el cuestionario inicial</label><button class="btn quiet sm" data-act="rewiz">Abrir</button></div>
     <div class="cell"><label>Borrar movimientos y reglas<em>El salario y la proyección se mantienen</em></label><button class="btn destruct sm" data-act="wipe">Borrar</button></div>
@@ -2425,7 +2814,7 @@ function viewAjustes(){
     <div class="cell"><label>Ver qué correos alcanza esta app<em>Lista los servidores y herramientas disponibles acá</em></label><button class="btn quiet sm" data-act="probe">Revisar</button></div>
     ${probe?probe.map(s=>`<div class="cell compact"><span class="tx"><b>${esc(s.name)}</b><span>${esc(s.detail)}</span></span><span class="val" style="font-size:14px;color:var(--label2)">${esc(s.state)}</span></div>`).join(""):""}
   </div>
-  <p class="note">Hoy solo leo Gmail, porque es el único conector que la app tiene declarado. Agregar Outlook o Microsoft 365 necesita los nombres exactos de sus herramientas, y esos solo se saben desde una conversación con Claude donde ese conector esté activo. Para leer cualquier correo sin depender de conectores hace falta el backend con reenvío.</p>`;
+  <p class="note">Pacci lee los avisos de BAC desde tu Gmail, con el permiso que le diste al entrar con Google. Nada más de tu correo. Si usás otro banco u otro correo, escribime y lo agregamos.</p>`;
 }
 function render(){
   const prevTab=$("#main").dataset.tab;
@@ -2658,7 +3047,11 @@ function openReset(){
     const b=ev.target.closest("[data-armar]");
     b.disabled=true;b.textContent="Borrando…";
     try{
-      if(store?.kind==="db"){
+      if(store?.kind==="sb"){
+        try{await sb.from("transactions").delete().eq("user_id",store.uid)}catch(e){}
+        try{await sb.from("profiles").update({settings:{}}).eq("user_id",store.uid)}catch(e){}
+      }
+      else if(store?.kind==="db"){
         for(const k of Object.keys(months)){try{await store.root.collection("months").doc(k).delete()}catch(e){}}
         try{await store.root.set(structuredClone(DEF))}catch(e){}
       }
@@ -2771,7 +3164,11 @@ document.addEventListener("click",async ev=>{
   const au=ev.target.closest("[data-auth]");
   if(au){
     const v=au.dataset.auth;
-    if(v==="pedir")pedirCodigo($("#correo")?.value);
+    if(v==="google")entrarConGoogle();
+    else if(v==="modoCorreo"){authModo="correo";authMsg="";render()}
+    else if(v==="modoGoogle"){authModo="google";authMsg="";render()}
+    else if(v==="conectarGmail")entrarConGoogle();
+    else if(v==="pedir")pedirCodigo($("#correo")?.value);
     else if(v==="verificar")verificarCodigo($("#codigo")?.value);
     else if(v==="otro")pedirCodigo(authCorreo);
     else if(v==="cambiar"){authPaso="correo";authMsg="";render();setTimeout(()=>$("#correo")?.focus(),100)}
@@ -2899,6 +3296,7 @@ document.addEventListener("click",async ev=>{
   else if(act==="addIncome")openIncome();
   else if(act==="ajustes"){tab="ajustes";render()}
   else if(act==="autoAporte"){settings.proj.aporte=null;await saveSettings();render()}
+  else if(act==="subirYa"){const ok=await subirPendientes();if(ok)render()}
   else if(act==="chat")openChat();
   else if(act==="limpiarChat"){chat=[];openChat()}
   else if(act==="enviarPreg"){const i=$("#chatInput");if(i)preguntar(i.value)}
@@ -2918,7 +3316,8 @@ document.addEventListener("click",async ev=>{
   else if(act==="reset")openReset();
   else if(act==="wipe"){
     if(!confirm("¿Borrar todos los movimientos y reglas guardadas?"))return;
-    if(store?.kind==="db")for(const k of Object.keys(months)){try{await store.root.collection("months").doc(k).delete()}catch(e){}}
+    if(store?.kind==="sb"){try{await sb.from("transactions").delete().eq("user_id",store.uid)}catch(e){toast("No se pudieron borrar en la nube.",true)}}
+    else if(store?.kind==="db")for(const k of Object.keys(months)){try{await store.root.collection("months").doc(k).delete()}catch(e){}}
     months={};const{salary,proj,fx,monthsBack}=settings;
     settings={...structuredClone(DEF),salary,proj,fx,monthsBack};
     await saveSettings();$("#toast").hidden=true;render();
@@ -2945,6 +3344,8 @@ document.addEventListener("input",ev=>{
   if(el.id==="gross"){settings.salary.gross=V;settings.salary.grossPer=V/(FREQ[settings.salary.freq]||1);settings.salary.cur="crc";queueSave();if(!settings.onboarded)return;repaintSalary();return}
   if(el.id==="grossPer"){const s=settings.salary;s.grossPer=V;recalcGross();queueSave();repaintWiz();return}
   if(el.id==="codigo"){
+    // El largo lo fija Supabase en Auth > Sign In/Providers > Email OTP Length.
+    // Si algún día se cambia allá, hay que cambiar el 6 de acá también.
     el.value=el.value.replace(/\D/g,"").slice(0,6);
     if(el.value.length===6)verificarCodigo(el.value);
     return;
@@ -3113,6 +3514,7 @@ render();
     try{
       const[mcp,sample]=await Promise.all([window.claude.use("mcp"),window.claude.use("sample")]);
       caps.mcp=mcp;caps.sample=sample;
+      if(mcp&&!gToken&&!sesion)authModo="correo";
     }catch(e){}
   }
   // 3) Datos
@@ -3120,7 +3522,9 @@ render();
   const ks=Object.keys(months).sort();
   if(ks.length&&!months[current])current=ks[ks.length-1];
   arrancando=false;
+  try{if(localStorage.getItem("pacci-pend"))marcarPendiente(true)}catch(e){}
   render();
+  if(pendiente)subirPendientes();
   if(hayAuth&&sesion===false)return;            // la pantalla de entrada se basta sola
   if(!window.claude?.use)toast("Abrí esta app desde claude.ai o la app de Claude para conectar Gmail.",true);
   else if(!caps.mcp)toast("Esta vista no puede leer Gmail. Abrila desde claude.ai o la app de Claude.",true);
