@@ -742,6 +742,30 @@ body.con-intro #scroll{overflow:hidden}
 .resta .fil.tot span{color:var(--ink);font-weight:750}
 .resta .fil.tot b{font-size:19px;font-weight:800;color:var(--brand)}
 .resta .fil.tot::before{height:1.5px;background:var(--ink);opacity:.14}
+
+/* ---------- entrar ---------- */
+.login{padding:34px 4px 0;text-align:center;max-width:380px;margin:0 auto}
+.login .mark-logo{width:62px;height:55px;margin-bottom:22px}
+.login h1{font-size:28px;font-weight:800;letter-spacing:-.045em;margin:0 0 10px}
+.login>p{margin:0 auto 26px;font-size:15px;line-height:1.55;color:var(--label2);font-weight:500;max-width:34ch}
+.login>p b{color:var(--ink);font-weight:700}
+.login input{width:100%;background:var(--card);border:1.5px solid var(--line);border-radius:17px;
+  padding:15px 17px;font-size:16px;font-weight:500;text-align:center;color:var(--ink);box-shadow:var(--shadow)}
+.login input:focus{outline:none;border-color:var(--brand-2)}
+.login input.codigo{font-size:27px;font-weight:800;letter-spacing:.2em;padding:16px 8px 16px 16px;
+  font-variant-numeric:tabular-nums}
+.login input::placeholder{color:var(--label3);letter-spacing:normal;font-weight:500}
+.login input.codigo::placeholder{letter-spacing:.2em;font-weight:800}
+.login-pie{display:flex;align-items:center;justify-content:center;gap:9px;margin-top:17px}
+.login-pie button{color:var(--brand);font-size:13.5px;font-weight:700}
+.login-pie span{color:var(--label3);font-size:13px}
+.login-error{margin:14px auto 0;font-size:13.5px;font-weight:600;color:var(--red);max-width:30ch}
+.login-legal{margin:44px auto 0;font-size:12px;line-height:1.5;color:var(--label3);font-weight:500;max-width:30ch}
+
+.splash{min-height:62dvh;display:grid;place-items:center}
+.splash .logo-marca{width:58px;height:51px;animation:latido 1.6s ease-in-out infinite}
+@keyframes latido{0%,100%{opacity:.4;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
+@media (prefers-reduced-motion:reduce){.splash .logo-marca{animation:none;opacity:1}}
 </style>
 <link rel="manifest" href="manifest.json">
 </head>
@@ -764,6 +788,7 @@ body.con-intro #scroll{overflow:hidden}
 
 <dialog id="dlg"><div class="sheet" id="sheet"></div></dialog>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
 (function(){
 "use strict";
@@ -806,7 +831,67 @@ const SALARY={gross:0,cur:"crc",etiqueta:"",rates:{sem:5.5,ivm:4.33,bp:1},isrOnG
 const PROJ={saldo:0,aporte:null,rate:5,plazo:12,meta:0,usaAguinaldo:true};
 const DEF={name:"",onboarded:false,tourDone:false,vioIntro:false,monedas:null,hormigaMax:5000,people:[],extraIncomes:[],hasSav:null,hasDebt:null,goals:[],fxDate:"2026-10-02",fx:460,monthsBack:5,includeOwn:false,rules:{},excludeKeys:{},debts:[],holder:"",skipped:[],lastSync:null,salary:structuredClone(SALARY),proj:structuredClone(PROJ)};
 let settings=structuredClone(DEF);
-let months={}, current=ymKey(new Date()), tab="inicio", filterCat=null, filterMet=null, filterSmall=false, query="", syncing=false, store=null, wiz=0, intro=null, tour=null, probe=null;
+let months={}, current=ymKey(new Date()), tab="inicio", filterCat=null, filterMet=null, filterSmall=false, query="", syncing=false, store=null, wiz=0, intro=null, tour=null, probe=null,
+    sb=null, sesion=null, alias=null, arrancando=true, authPaso="correo", authCorreo="", authMsg="", authCargando=false;
+
+/* ===== Cuenta ===== */
+// La llave publishable es pública a propósito: por sí sola no puede leer nada,
+// porque las reglas de la base (Fase 1) solo dejan ver lo de cada quien.
+const SB_URL="https://encyskhwfmeqofxjuovo.supabase.co";
+const SB_KEY="sb_publishable_mDloW8NbyEtzMdbjVkVzIA_joVexYmT";
+
+async function initAuth(){
+  try{
+    if(!window.supabase?.createClient)return false;
+    sb=window.supabase.createClient(SB_URL,SB_KEY,{auth:{persistSession:true,autoRefreshToken:true}});
+    const{data,error}=await sb.auth.getSession();
+    if(error)throw error;
+    sesion=data?.session||false;
+    sb.auth.onAuthStateChange((_e,s)=>{
+      const antes=!!sesion; sesion=s||false;
+      if(s&&!antes){traerAlias().then(render)}
+      render();
+    });
+    if(sesion)traerAlias();
+    return true;
+  }catch(e){console.warn("auth",e);sb=null;sesion=null;return false}
+}
+async function traerAlias(){
+  try{
+    const{data}=await sb.from("accounts").select("alias").maybeSingle();
+    alias=data?.alias||null;
+  }catch(e){alias=null}
+}
+async function pedirCodigo(correo){
+  correo=(correo||"").trim().toLowerCase();
+  if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(correo)){authMsg="Ese correo no se ve bien.";render();return}
+  authCargando=true;authMsg="";render();
+  const{error}=await sb.auth.signInWithOtp({email:correo,options:{shouldCreateUser:true}});
+  authCargando=false;
+  if(error){
+    authMsg=/rate|limit|seconds/i.test(error.message)
+      ? "Esperá un momento antes de pedir otro código."
+      : "No se pudo mandar el correo. Probá de nuevo.";
+  } else {authCorreo=correo;authPaso="codigo";authMsg=""}
+  render();
+  if(authPaso==="codigo")setTimeout(()=>$("#codigo")?.focus(),120);
+}
+async function verificarCodigo(code){
+  code=(code||"").replace(/\D/g,"");
+  if(code.length<6){authMsg="El código es de 6 dígitos.";render();return}
+  authCargando=true;authMsg="";render();
+  const{error}=await sb.auth.verifyOtp({email:authCorreo,token:code,type:"email"});
+  authCargando=false;
+  if(error){authMsg="Ese código no sirve o ya venció.";render();return}
+  authPaso="correo";authMsg="";
+  await traerAlias();
+  render();
+}
+async function salirCuenta(){
+  try{await sb.auth.signOut()}catch(e){}
+  sesion=false;alias=null;authPaso="correo";authCorreo="";
+  closeSheet();render();
+}
 const caps={mcp:null,sample:null};
 
 /* ===== Utilidades ===== */
@@ -2267,6 +2352,35 @@ const WIZ=[
    <div class="tip">${IC_META.reloj}<p>El tipo de cambio lo tomamos del <b>BCCR</b> automáticamente, hoy ${esc(fCRC.format(TC()))} por dólar. No tenés que escribirlo.</p></div>`}
 ];
 
+function viewLogin(){
+  hdrTitle="Pacci";
+  const correo=authPaso==="codigo";
+  return `<div class="login">
+    <i class="logo-marca mark-logo"></i>
+    <h1>${correo?"Revisá tu correo":"Entrá a Pacci"}</h1>
+    <p>${correo
+      ? `Te mandamos un código de 6 dígitos a <b>${esc(authCorreo)}</b>. Puede tardar un minuto.`
+      : "Con tu correo basta. No hay que inventarse una contraseña más."}</p>
+    ${correo?`
+      <input id="codigo" type="text" inputmode="numeric" autocomplete="one-time-code"
+             maxlength="6" placeholder="000000" class="codigo" aria-label="Código de 6 dígitos">
+      <button class="btn" data-auth="verificar" ${authCargando?"disabled":""} style="width:100%;margin-top:14px">
+        ${authCargando?"Entrando…":"Entrar"}</button>
+      <div class="login-pie">
+        <button data-auth="otro">Reenviar código</button>
+        <span>·</span>
+        <button data-auth="cambiar">Usar otro correo</button>
+      </div>`
+    :`
+      <input id="correo" type="email" inputmode="email" autocomplete="email" autocapitalize="off"
+             spellcheck="false" placeholder="tucorreo@gmail.com" value="${esc(authCorreo)}" aria-label="Tu correo">
+      <button class="btn" data-auth="pedir" ${authCargando?"disabled":""} style="width:100%;margin-top:14px">
+        ${authCargando?"Mandando…":"Mandame el código"}</button>`}
+    ${authMsg?`<p class="login-error">${esc(authMsg)}</p>`:""}
+    <p class="login-legal">Tus datos quedan ligados a este correo y solo vos los podés ver.</p>
+  </div>`;
+}
+
 function viewWizard(){
   const i=Math.max(0,Math.min(wiz,WIZ.length-1)), step=WIZ[i], ultimo=i>=WIZ.length-1;
   hdrTitle=step.t||"Pacci";
@@ -2299,6 +2413,8 @@ function viewAjustes(){
   <div class="group">
     <div class="cell"><label>Última sincronización</label><span class="val" style="font-size:15px;color:var(--label2)">${settings.lastSync?esc(new Date(settings.lastSync).toLocaleString("es-CR",{day:"numeric",month:"short",hour:"numeric",minute:"2-digit"})):"Nunca"}</span></div>
     <div class="cell"><label>Dónde se guardan<em>${store?.kind==="db"?"En tu cuenta de Claude, privados para vos":"Solo en este navegador"}</em></label></div>
+    ${sesion?`<div class="cell"><label>Tu cuenta<em>${esc(sesion.user?.email||"")}</em></label><button class="btn quiet sm" data-auth="salir">Salir</button></div>
+    ${alias?`<div class="cell"><label>Tu correo de Pacci<em>Este es el que vas a meter en el banco</em></label><span class="val" style="font-size:12.5px">${esc(alias)}@in.pacci.app</span></div>`:""}`:""}
     <div class="cell"><label>Cómo funciona Pacci<em>Las cuatro pantallas de la bienvenida</em></label><button class="btn quiet sm" data-intro="abrir">Ver</button></div>
     <div class="cell"><label>Repetir el cuestionario inicial</label><button class="btn quiet sm" data-act="rewiz">Abrir</button></div>
     <div class="cell"><label>Borrar movimientos y reglas<em>El salario y la proyección se mantienen</em></label><button class="btn destruct sm" data-act="wipe">Borrar</button></div>
@@ -2313,7 +2429,7 @@ function viewAjustes(){
 }
 function render(){
   const prevTab=$("#main").dataset.tab;
-  const v=!settings.onboarded?viewWizard():tab==="inicio"?viewInicio():tab==="gastos"?viewGastos():tab==="salario"?viewSalario():tab==="proy"?viewProy():tab==="deudas"?viewDeudas():viewAjustes();
+  const v=arrancando?`<div class="splash"><i class="logo-marca"></i></div>`:sesion===false?viewLogin():!settings.onboarded?viewWizard():tab==="inicio"?viewInicio():tab==="gastos"?viewGastos():tab==="salario"?viewSalario():tab==="proy"?viewProy():tab==="deudas"?viewDeudas():viewAjustes();
   const m=$("#main");
   m.innerHTML=`<div class="page">${v}</div>`;
   m.dataset.tab=tab;
@@ -2324,7 +2440,7 @@ function render(){
   if(prevTab!==tab)$("#scroll").scrollTop=0;
   onScroll();
   document.querySelectorAll("nav.tabs button").forEach(b=>b.setAttribute("aria-current",b.dataset.tab===tab?"page":"false"));
-  document.querySelector("nav.tabs").hidden=!settings.onboarded||intro!==null;
+  document.querySelector("nav.tabs").hidden=arrancando||!settings.onboarded||intro!==null||sesion===false;
   if(intro!==null)animarIntro();
   document.body.classList.toggle("con-intro",intro!==null);
   requestAnimationFrame(()=>requestAnimationFrame(pintarTour));
@@ -2652,6 +2768,16 @@ document.addEventListener("click",async ev=>{
     tour++;if(tour>=TOUR.length)cerrarTour();else pintarTour();
     return;
   }
+  const au=ev.target.closest("[data-auth]");
+  if(au){
+    const v=au.dataset.auth;
+    if(v==="pedir")pedirCodigo($("#correo")?.value);
+    else if(v==="verificar")verificarCodigo($("#codigo")?.value);
+    else if(v==="otro")pedirCodigo(authCorreo);
+    else if(v==="cambiar"){authPaso="correo";authMsg="";render();setTimeout(()=>$("#correo")?.focus(),100)}
+    else if(v==="salir")salirCuenta();
+    return;
+  }
   const ix=ev.target.closest("[data-intro]");
   if(ix){
     const v=ix.dataset.intro;
@@ -2799,6 +2925,8 @@ document.addEventListener("click",async ev=>{
   }
 });
 document.addEventListener("keydown",ev=>{
+  if(ev.key==="Enter"&&ev.target.id==="correo"){ev.preventDefault();pedirCodigo(ev.target.value);return}
+  if(ev.key==="Enter"&&ev.target.id==="codigo"){ev.preventDefault();verificarCodigo(ev.target.value);return}
   if(ev.target.id==="chatInput"&&ev.key==="Enter"&&!ev.shiftKey){
     ev.preventDefault();preguntar(ev.target.value);
   }
@@ -2816,6 +2944,12 @@ document.addEventListener("input",ev=>{
   }
   if(el.id==="gross"){settings.salary.gross=V;settings.salary.grossPer=V/(FREQ[settings.salary.freq]||1);settings.salary.cur="crc";queueSave();if(!settings.onboarded)return;repaintSalary();return}
   if(el.id==="grossPer"){const s=settings.salary;s.grossPer=V;recalcGross();queueSave();repaintWiz();return}
+  if(el.id==="codigo"){
+    el.value=el.value.replace(/\D/g,"").slice(0,6);
+    if(el.value.length===6)verificarCodigo(el.value);
+    return;
+  }
+  if(el.id==="correo"){authCorreo=el.value;return}
   if(el.id==="chatInput"){el.style.height="auto";el.style.height=Math.min(el.scrollHeight,120)+"px";return}
   if(el.id==="diaPago"){settings.salary.dia=el.value;queueSave();return}
   if(el.id==="salEtiq"){settings.salary.etiqueta=el.value;queueSave();return}
@@ -2972,14 +3106,24 @@ function closeSheet(){
 /* ===== Arranque ===== */
 render();
 (async()=>{
-  if(!window.claude?.use){await initStore();render();toast("Abrí esta app desde claude.ai o la app de Claude para conectar Gmail.",true);return}
-  const[mcp,sample]=await Promise.all([window.claude.use("mcp"),window.claude.use("sample")]);
-  caps.mcp=mcp;caps.sample=sample;
+  // 1) ¿Hay sesión? Si la librería no carga, la app sigue andando en modo local.
+  const hayAuth=await initAuth();
+  // 2) Capacidades de claude.ai, si estamos adentro
+  if(window.claude?.use){
+    try{
+      const[mcp,sample]=await Promise.all([window.claude.use("mcp"),window.claude.use("sample")]);
+      caps.mcp=mcp;caps.sample=sample;
+    }catch(e){}
+  }
+  // 3) Datos
   await initStore();
   const ks=Object.keys(months).sort();
   if(ks.length&&!months[current])current=ks[ks.length-1];
+  arrancando=false;
   render();
-  if(!mcp)toast("Esta vista no puede leer Gmail. Abrila desde claude.ai o la app de Claude.",true);
+  if(hayAuth&&sesion===false)return;            // la pantalla de entrada se basta sola
+  if(!window.claude?.use)toast("Abrí esta app desde claude.ai o la app de Claude para conectar Gmail.",true);
+  else if(!caps.mcp)toast("Esta vista no puede leer Gmail. Abrila desde claude.ai o la app de Claude.",true);
 })();
 })();
 </script>
